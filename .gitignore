@@ -1,0 +1,15 @@
+# 排除虚拟环境 (最重要的)
+.qtcreator/Python_3_8_10venv/
+
+# 排除 Qt Creator 自动生成的本地配置
+.qtcreator/
+*.user
+
+# 排除 Python 缓存
+__pycache__/
+*.pyc
+
+# 排除录制的大型原始数据
+recordings/
+*.raw
+*.dat
