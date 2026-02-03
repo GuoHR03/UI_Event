@@ -1,5 +1,12 @@
 [project]
-name = "PySide Project"
+name = "UI EVENT"
 
 [tool.pyside6-project]
-files = ["widget.py"]
+files = [
+    ".gitignore",
+    "backend",
+    "form.ui",
+    "libs/",
+    "requirements.txt",
+    "widget.py",
+]
