@@ -1,0 +1,15 @@
+[project]
+name = "PySide Project"
+
+[tool.pyside6-project]
+# 在这里列出所有需要显示和使用的文件及文件夹
+files = [
+    ".gitignore",
+    "NetworkThread.py",
+    "backend",
+    "form.ui",
+    "libs/",
+    "requirements.txt",
+    "widget.py",
+    "linux_backend.py",
+]
