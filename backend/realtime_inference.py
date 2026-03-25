@@ -1,37 +1,70 @@
-from PyQt6.QtCore import QThread, pyqtSignal
-import queue
+import torch
+import numpy as np
+import os
+import sys
+current_root = os.getcwd() 
+modules_parent_dir = os.path.join(current_root, "backend", "Eventmamba", "models")
 
-class PredictThread(QThread):
-    # 预测结果信号，返回字符串给 UI 界面显示
-    result_signal = pyqtSignal(str)
+if modules_parent_dir not in sys.path:
+    sys.path.append(modules_parent_dir)
+from backend.Eventmamba.models.eventmamba_v1 import EventMamba
 
+def inplace_relu(m):
+    classname = m.__class__.__name__
+    if classname.find('ReLU') != -1:
+        m.inplace = True
+
+def process_evs_numpy2tensor(data_numpy,weight = 640,height = 480 ,sample_size = 1024):
+    """处理numpy的数据,输出tensor数据,中间会对数据进行sort分类,以及归一化"""
+
+    # 归一化
+    x_values = data_numpy[:, 0] / weight
+    y_values = data_numpy[:, 1] / height
+    t_values = data_numpy[:, 2]
+    t_max = t_values.max()
+    t_min = t_values.min()
+    t_values = (t_values - t_min) / (t_max - t_min + 1e-5)
+
+    # 选取1024个点
+    current_sample_size = len(t_values)
+    indices = np.random.choice(current_sample_size, sample_size, replace=False)
+    indices = np.sort(indices)
+    x = x_values[indices]
+    y = y_values[indices]
+    t = t_values[indices]
+    data_chulihou  = np.stack((t,x,y), axis=-1) #修改
+    data_tensor = torch.from_numpy(data_chulihou).unsqueeze(0).permute(0, 2, 1)
+    return data_tensor
+
+class EventMambaPredictor:
     def __init__(self):
-        super().__init__()
-        # 队列用于接收原始事件包，maxsize=1 保证只处理最新的数据
-        self.input_queue = queue.Queue(maxsize=1)
-        self.is_running = True
+        self.width = 640 
+        self.height = 480
+        self.frame = 0  #删除
+        self.model = EventMamba(num_classes=2).cuda()
+        #加载权重
+        self.model.eval()
+        self.model.apply(inplace_relu)
 
-    def run(self):
-        while self.is_running:
-            try:
-                # 尝试从队列获取数据，设置超时防止死锁
-                raw_evs = self.input_queue.get(timeout=0.1)
+    def process_data(self, data):
+        try:
+            self.frame += 1 #删除
+            if isinstance(data, dict) and data.get("msg_type") == "CONFIG":
+                            self.cam_width = data["width"]
+                            self.cam_height = data["height"]
+                            print(f"收到相机参数更新: {self.cam_width}x{self.cam_height}")
+                            return "相机参数初始化成功" # 直接返回，不需要推理
 
-                # ---- 在这里调用你的模型推理逻辑 ----
-                # 1. 预处理（例如转为 Tensor 或 Event Stack）
-                # 2. 推理：output = model(tensor)
-                # ----------------------------------
+            tensor_data = process_evs_numpy2tensor(data).cuda() #(1, 3, 1024)
 
-                # 模拟预测结果并发射信号
-                res_text = f"检测到 {len(raw_evs)} 个事件点"
-                self.result_signal.emit(res_text)
+            with torch.no_grad():
+                output = self.model(tensor_data)
+                result = output.squeeze().cpu().numpy().tolist()
+            
+            res_text = f"输出结果为：{result}" 
+            return res_text
 
-            except queue.Empty:
-                continue
-            except Exception as e:
-                print(f"推理线程出错: {e}")
-                continue
-
-    def stop(self):
-        self.is_running = False
-        self.wait()
+        except Exception as e:
+            error_msg = f"模型推理出错: {str(e)}"
+            print(error_msg)
+            return error_msg
