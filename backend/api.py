@@ -85,7 +85,8 @@ class BackendAPI(QObject):
             )
 
         if self.network_thread is None or not self.network_thread.isRunning():
-            self.network_thread = NetworkThread(self.camera_queue, host=host, port=port)
+            base_url = f"http://{host}:{port}"
+            self.network_thread = NetworkThread(self.camera_queue, base_url=base_url)
             self.network_thread.result_signal.connect(self.prediction_signal.emit)
             self.network_thread.start()
 
