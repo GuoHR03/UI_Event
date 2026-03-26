@@ -49,6 +49,11 @@
     <layout class="QHBoxLayout" name="horizontalLayout_4">
      <item>
       <widget class="QLabel" name="pt_path_label">
+       <property name="styleSheet">
+        <string notr="true"> background-color: #F8F9FA;  /* 浅灰底色，区分出这是一个框 */
+border: 1px solid #DCE0E4;  /* 加个淡淡的边框 */
+ border-radius: 5px;         /* 圆角，看着更现代 */</string>
+       </property>
        <property name="text">
         <string>EventMamba路径</string>
        </property>
@@ -85,9 +90,9 @@
      <item>
       <widget class="QLabel" name="file_path_label">
        <property name="styleSheet">
-        <string notr="true"> /* background-color: #F8F9FA;  /* 浅灰底色，区分出这是一个框 */
-                /* border: 1px solid #DCE0E4;  /* 加个淡淡的边框 */
-                 /* border-radius: 5px;         /* 圆角，看着更现代 */</string>
+        <string notr="true"> background-color: #F8F9FA;  /* 浅灰底色，区分出这是一个框 */
+border: 1px solid #DCE0E4;  /* 加个淡淡的边框 */
+ border-radius: 5px;         /* 圆角，看着更现代 */</string>
        </property>
        <property name="text">
         <string>RAW文件路径</string>
@@ -198,7 +203,13 @@
     </layout>
    </item>
    <item>
-    <widget class="QTextEdit" name="textEdit"/>
+    <widget class="QTextEdit" name="textEdit">
+     <property name="styleSheet">
+      <string notr="true"> background-color: #F8F9FA;  /* 浅灰底色，区分出这是一个框 */
+border: 1px solid #DCE0E4;  /* 加个淡淡的边框 */
+ border-radius: 5px;         /* 圆角，看着更现代 */</string>
+     </property>
+    </widget>
    </item>
   </layout>
  </widget>
