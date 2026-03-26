@@ -54,11 +54,8 @@
 
 
 import argparse
-import base64
-import json
 import sys
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import numpy as np
+import zmq
 import torch
 from backend.realtime_inference import EventMambaPredictor
 
@@ -66,8 +63,8 @@ class InferenceServer:
     def __init__(self, weight_path, port=5555):
         self.port = port
         self.weight_path = weight_path
-        self.config = {}
-
+        self.running = True
+        
         print(f" [初始化] 正在加载模型权重: {self.weight_path} ...")
         try:
             self.model = EventMambaPredictor()
@@ -76,81 +73,40 @@ class InferenceServer:
             print(f"[致命错误] 模型加载失败: {e}")
             sys.exit(1)
 
-        handler = self._build_handler()
-        self.httpd = ThreadingHTTPServer(("", self.port), handler)
-        print(f" [就绪] HTTP 服务端已绑定端口 {self.port}，等待请求...")
-
-    def _build_handler(self):
-        server = self
-
-        class Handler(BaseHTTPRequestHandler):
-            def do_GET(self):
-                if self.path == "/health":
-                    self._send_json(200, {"status": "ok"})
-                else:
-                    self._send_json(404, {"error": "not_found"})
-
-            def do_POST(self):
-                length = int(self.headers.get("Content-Length", "0"))
-                body = self.rfile.read(length) if length > 0 else b""
-                try:
-                    payload = json.loads(body.decode("utf-8")) if body else {}
-                except Exception:
-                    self._send_json(400, {"error": "bad_json"})
-                    return
-
-                if self.path == "/config":
-                    try:
-                        result = server.handle_config(payload)
-                        self._send_json(200, result)
-                    except Exception as e:
-                        self._send_json(500, {"error": str(e)})
-                    return
-
-                if self.path == "/infer":
-                    try:
-                        result_text = server.handle_infer(payload)
-                        self._send_json(200, {"result": result_text})
-                    except Exception as e:
-                        self._send_json(500, {"error": str(e)})
-                    return
-
-                self._send_json(404, {"error": "not_found"})
-
-            def _send_json(self, status_code, payload):
-                data = json.dumps(payload).encode("utf-8")
-                self.send_response(status_code)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-
-            def log_message(self, format, *args):
-                return
-
-        return Handler
-
-    def handle_config(self, config_data):
-        self.config = config_data
-        return {"status": "ok"}
-
-    def handle_infer(self, payload):
-        data_b64 = payload.get("data_b64")
-        shape = payload.get("shape")
-        dtype = payload.get("dtype")
-        if not data_b64 or not shape or not dtype:
-            raise ValueError("invalid_payload")
-        raw = base64.b64decode(data_b64)
-        array = np.frombuffer(raw, dtype=np.dtype(dtype))
-        array = array.reshape(shape)
-        return self.model.process_data(array)
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REP)
+        self.socket.setsockopt(zmq.LINGER, 0)
+        self.socket.setsockopt(zmq.RCVHWM, 1)
+        self.socket.setsockopt(zmq.CONFLATE, 1)
+        self.socket.bind(f"tcp://0.0.0.0:{self.port}")
+        print(f" [就绪] ZMQ 服务端已绑定端口 {self.port}，等待请求...")
 
     def run(self):
-        self.httpd.serve_forever()
+        while self.running:
+            try:
+                data = self.socket.recv_pyobj()
+
+                if isinstance(data, dict) and data.get("msg_type") == "CONFIG":
+                    self.handle_config(data)
+                    continue
+
+                result_text = self.model.process_data(data)
+                self.socket.send_string(result_text)
+
+            except Exception as e:
+                print(f" [警告] 推理循环出错: {e}")
+                try:
+                    self.socket.send_string(f"Error: {str(e)}")
+                except:
+                    pass
+
+    def handle_config(self, config_data):
+        self.socket.send_string("CONFIG_OK")
 
     def stop(self):
-        self.httpd.shutdown()
-        self.httpd.server_close()
+        self.running = False
+        self.socket.close()
+        self.context.term()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         print(" [退出] 引擎已安全关闭，资源已释放。")
@@ -159,7 +115,7 @@ class InferenceServer:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="EventMamba Linux Backend Server")
     parser.add_argument("--weights", type=str, required=True, help="模型 .pt 权重文件的路径")
-    parser.add_argument("--port", type=int, default=5555, help="HTTP 绑定的端口号")
+    parser.add_argument("--port", type=int, default=5555, help="ZMQ 绑定的端口号")
     args = parser.parse_args()
 
     server = InferenceServer(weight_path=args.weights, port=args.port)
