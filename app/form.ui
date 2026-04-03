@@ -19,7 +19,7 @@
   <property name="windowTitle">
    <string>Form</string>
   </property>
-  <layout class="QVBoxLayout" name="verticalLayout" stretch="600,0,0,0,40,40">
+  <layout class="QVBoxLayout" name="verticalLayout" stretch="600,0,0,0,0,40,40">
    <item>
     <widget class="QLabel" name="image_label">
      <property name="sizePolicy">
@@ -46,9 +46,22 @@
     </widget>
    </item>
    <item>
+    <widget class="QPushButton" name="choice_btn">
+     <property name="text">
+      <string>PushButton</string>
+     </property>
+    </widget>
+   </item>
+   <item>
     <layout class="QHBoxLayout" name="horizontalLayout_4">
      <item>
       <widget class="QLabel" name="pt_path_label">
+       <property name="sizePolicy">
+        <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
+         <horstretch>0</horstretch>
+         <verstretch>0</verstretch>
+        </sizepolicy>
+       </property>
        <property name="styleSheet">
         <string notr="true"> background-color: #F8F9FA;  /* 浅灰底色，区分出这是一个框 */
 border: 1px solid #DCE0E4;  /* 加个淡淡的边框 */
@@ -72,14 +85,14 @@ border: 1px solid #DCE0E4;  /* 加个淡淡的边框 */
      <item>
       <widget class="QPushButton" name="apply_pt_btn">
        <property name="text">
-        <string>加载权重</string>
+        <string>加载模型</string>
        </property>
       </widget>
      </item>
      <item>
       <widget class="QPushButton" name="close_pt_btn">
        <property name="text">
-        <string>关闭</string>
+        <string>关闭模型</string>
        </property>
       </widget>
      </item>
@@ -89,6 +102,12 @@ border: 1px solid #DCE0E4;  /* 加个淡淡的边框 */
     <layout class="QHBoxLayout" name="horizontalLayout_3">
      <item>
       <widget class="QLabel" name="file_path_label">
+       <property name="sizePolicy">
+        <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
+         <horstretch>0</horstretch>
+         <verstretch>0</verstretch>
+        </sizepolicy>
+       </property>
        <property name="styleSheet">
         <string notr="true"> background-color: #F8F9FA;  /* 浅灰底色，区分出这是一个框 */
 border: 1px solid #DCE0E4;  /* 加个淡淡的边框 */
@@ -179,6 +198,9 @@ border: 1px solid #DCE0E4;  /* 加个淡淡的边框 */
        </property>
        <property name="maximum">
         <double>999.990000000000009</double>
+       </property>
+       <property name="value">
+        <double>30.000000000000000</double>
        </property>
       </widget>
      </item>

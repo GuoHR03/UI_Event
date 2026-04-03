@@ -1,10 +1,29 @@
 import sys
+import os
 import traceback
+import ast
 from PyQt6.QtWidgets import QApplication, QWidget
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtGui import QImage, QPixmap, QPainter, QPen, QColor
 from PyQt6.QtWidgets import QFileDialog
 from PyQt6 import uic
+from choose_windows import choose_Window
+base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+root_dir = os.path.abspath(os.path.join(base_dir, ".."))
+if os.path.isdir(os.path.join(root_dir, "backend")) and root_dir not in sys.path:
+    sys.path.insert(0, root_dir)
+
+sdk_root = os.environ.get("METAVISION_SDK_PATH", "E:\\Metavision\\Prophesee")
+extra_dll_dirs = [
+    os.path.join(root_dir, "libs", "bin"),
+    os.path.join(sdk_root, "bin"),
+    os.path.join(sdk_root, "third_party", "bin"),
+    os.path.join(sdk_root, "lib", "hdf5", "plugin"),
+]
+for dll_dir in extra_dll_dirs:
+    if os.path.isdir(dll_dir):
+        os.add_dll_directory(dll_dir)
+
 from backend.api import BackendAPI
 
 
@@ -21,12 +40,14 @@ sys.excepthook = exception_hook
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
-        uic.loadUi('form.ui', self)
+        ui_path = os.path.join(base_dir, "form.ui")
+        uic.loadUi(ui_path, self)
 
         #信号与槽
         self.start_btn.clicked.connect(self.toggle_camera)
         self.record_btn.clicked.connect(self.toggle_recording)
         self.record_btn.setEnabled(False)
+        self.choice_btn.clicked.connect(self.choose_windowShow)
         self.combo_palette.currentTextChanged.connect(self.change_camera)
         self.fpsEdit.valueChanged.connect(self.change_camera)
         self.select_pt_btn.clicked.connect(self.choose_file_pt)
@@ -41,6 +62,8 @@ class MainWindow(QWidget):
         self.backend.playback_finished_signal.connect(self.on_playback_finished)
         self.file_path = None
         self.pt_path = None
+        self.last_pred = None
+        self.last_pred_mode = None
 
     def toggle_camera(self):
         """相机启动链接的槽"""
@@ -51,23 +74,12 @@ class MainWindow(QWidget):
         else:
             """关闭相机"""
             self.stop_camera_logic()
-            """
-            self.camera_thread.stop() #发出停止指令
-            self.camera_thread.wait() #彻底执行完run()
-            self.camera_thread.deleteLater() #发出删除对象指令
-            self._dying_thread = self.camera_thread #把旧进程放在此处，等到下次的时候，才会完全被清理
-            self.camera_thread = None
-            self.start_btn.setText("启动相机")
-            self.record_btn.setEnabled(False)
-            self.record_btn.setText("开始录制")
-            self.image_label.setText("相机已停止")
-            """
 
     def toggle_recording(self):
         if self.backend.is_camera_running() and self.backend.camera_thread:
             if not self.backend.camera_thread.is_recording:
                 self.backend.start_recording()
-                self.record_btn.setText("停止录制 (正在写入...)")
+                self.record_btn.setText("停止录制")
                 self.record_btn.setStyleSheet("background-color: red; color: white;")
             else:
                 self.backend.stop_recording()
@@ -87,12 +99,23 @@ class MainWindow(QWidget):
             img_format = QImage.Format.Format_Grayscale8
 
         q_img = QImage(cv_img.data, width, height, bytes_per_line, img_format)
+        if self.last_pred is not None:
+            px, py = self._map_pred_to_pixel(width, height)
+            if px is not None and py is not None:
+                painter = QPainter(q_img)
+                pen = QPen(QColor(255, 0, 0))
+                pen.setWidth(3)
+                painter.setPen(pen)
+                painter.setBrush(QColor(255, 0, 0, 80))
+                painter.drawEllipse(px - 8, py - 8, 16, 16)
+                painter.end()
 
         pixmap = QPixmap.fromImage(q_img)
         self.image_label.setPixmap(pixmap.scaled(
             self.image_label.size(),
             Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation
+            Qt.TransformationMode.FastTransformation
+            #Qt.TransformationMode.SmoothTransformation
         ))
 
     def closeEvent(self, event):
@@ -110,9 +133,8 @@ class MainWindow(QWidget):
     def update_prediction_ui(self,result):
         """更新网络输出到UI文本框"""
         self.textEdit.append(result)
+        self._update_last_prediction(result)
         #self.textEdit.setText(result)
-
-
 
     #  从这里继续查代码
     def on_playback_finished(self):
@@ -125,20 +147,22 @@ class MainWindow(QWidget):
 
         self.start_btn.setText("启动相机")
         self.record_btn.setEnabled(False)
-        self.image_label.setText("播放已结束/相机已停止")
+        self.image_label.setText("相机未启动")
+        self.current_cam_size = None
 
     def choose_file(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "选择离线视频文件",
             "",
-            "RAW 视频 (*.raw);;所有文件 (*)"
+            "视频(*.raw *.hdf5 *.h5 *.aedat4);;所有文件 (*)"
         )
         if file_path:
             self.file_path = file_path
             self.backend.set_input_file(file_path)
             self.file_path_label.setText(file_path)
             # 修改
+            self.file_path_label.setText(os.path.basename(file_path))
             if self.backend.is_camera_running():
                 self.toggle_camera()
 
@@ -147,19 +171,18 @@ class MainWindow(QWidget):
                 self,
                 "选择权重文件",
                 "",
-                "pt (*.pt);;所有文件 (*)"
+                "pth (*.pth);;所有文件 (*)"
             )
             if pt_path:
                 self.pt_path = pt_path
                 self.pt_path_label.setText(pt_path)
                 # 修改
+                self.pt_path_label.setText(os.path.basename(pt_path))
                 if self.backend.is_camera_running():
                     self.toggle_camera()
 
-
     def load_Eventmamba(self):
         """加载Eventmamba模型以及网络通信"""
-        print("加载")
         if self.pt_path == None:
             print("没有加载权重")
         else:
@@ -173,6 +196,48 @@ class MainWindow(QWidget):
         self.backend.stop_eventmamba()
         self.apply_pt_btn.setEnabled(True)
         self.close_pt_btn.setEnabled(False)
+        self.last_pred = None
+        self.last_pred_mode = None
+
+    def _update_last_prediction(self, result):
+        if not isinstance(result, str):
+            return
+        marker = "输出结果为："
+        if marker not in result:
+            return
+        payload = result.split(marker, 1)[1].strip()
+        try:
+            values = ast.literal_eval(payload)
+        except Exception:
+            return
+        if not isinstance(values, (list, tuple)) or len(values) < 2:
+            return
+        x, y = values[0], values[1]
+        if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+            return
+        self.last_pred = (float(x), float(y))
+        if 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0:
+            self.last_pred_mode = "norm"
+        else:
+            self.last_pred_mode = "pixel"
+
+    def _map_pred_to_pixel(self, width, height):
+        if self.last_pred is None:
+            return None, None
+        x, y = self.last_pred
+        if self.last_pred_mode == "norm":
+            px = int(x * width)
+            py = int(y * height)
+        else:
+            px = int(x)
+            py = int(y)
+        if px < 0 or py < 0 or px >= width or py >= height:
+            return None, None
+        return px, py
+
+    def choose_windowShow(self):
+        self.new_window = choose_Window()
+        self.new_window.show()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

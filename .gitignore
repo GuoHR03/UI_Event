@@ -12,4 +12,21 @@ __pycache__/
 # 排除录制的大型原始数据
 recordings/
 *.raw
+*.raw.tmp_index
 *.dat
+
+# 排除模型权重文件
+app/checkpoint/
+backend/Eventmamba/checkpoint/
+*.pth
+*.pt
+
+# 排除构建文件
+build/
+*.spec
+*.iss
+
+# 排除安装脚本
+install_wsl.bat
+uninstall_wsl.bat
+run_app.bat

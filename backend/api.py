@@ -5,7 +5,7 @@ import subprocess
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from backend.Camera import CameraThread
-from NetworkThread import NetworkThread
+from backend.NetworkThread import NetworkThread
 
 
 class BackendAPI(QObject):
@@ -71,29 +71,36 @@ class BackendAPI(QObject):
         if not weights_path:
             raise ValueError("weights_path is required")
 
+        wsl_weights_path = self._to_wsl_path(weights_path)
+
         if self.backend_process is None or self.backend_process.poll() is not None:
             current_dir = os.path.dirname(os.path.abspath(__file__))
             project_dir = os.path.dirname(current_dir)
-            linux_python = "/home/tianmu/anaconda3/envs/eventmamba/bin/python"
+            #linux_python = "/home/tianmu/anaconda3/envs/eventmamba/bin/python"
+            linux_python = "/opt/miniconda3/envs/eventmamba/bin/python"
+            wsl_distro = "EventMamba_mini"
             linux_script = "linux_backend.py"
-            cmd = ["wsl", linux_python, linux_script, "--weights", weights_path, "--port", str(port)]
+            cmd = ["wsl", "-d", wsl_distro,
+                   linux_python, linux_script, "--weights", wsl_weights_path, "--port", str(port)]
             self.backend_process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 cwd=project_dir,
             )
-
+        
         if self.network_thread is None or not self.network_thread.isRunning():
-            base_url = f"http://{host}:{port}"
-            self.network_thread = NetworkThread(self.camera_queue, base_url=base_url)
+            self.network_thread = NetworkThread(self.camera_queue, host=host, port=port)
             self.network_thread.result_signal.connect(self.prediction_signal.emit)
             self.network_thread.start()
+        self._enqueue_camera_config()
 
     def stop_eventmamba(self):
         if self.network_thread:
             self.network_thread.stop()
-            self.network_thread.wait()
+            if not self.network_thread.wait(1000):
+                self.network_thread.terminate()
+                self.network_thread.wait(500)
             self.network_thread.deleteLater()
             self.network_thread = None
 
@@ -120,3 +127,36 @@ class BackendAPI(QObject):
     def close(self):
         self.stop_camera()
         self.stop_eventmamba()
+
+    def _enqueue_camera_config(self):
+        if not self.camera_thread or not self.camera_thread.isRunning():
+            return
+        payload = {
+            "msg_type": "CONFIG",
+            "width": self.camera_thread.width,
+            "height": self.camera_thread.height,
+        }
+        while not self.camera_queue.empty():
+            try:
+                self.camera_queue.get_nowait()
+            except queue.Empty:
+                break
+        try:
+            self.camera_queue.put_nowait(payload)
+        except queue.Full:
+            pass
+
+    def _to_wsl_path(self, path):
+        if not path:
+            return path
+        if path.startswith("\\\\wsl$\\"):
+            parts = path.split("\\")
+            if len(parts) >= 4:
+                distro = parts[2]
+                inner = "/".join(parts[3:])
+                return f"/mnt/wsl/{distro}/{inner}".replace("\\", "/")
+        if len(path) >= 2 and path[1] == ":":
+            drive = path[0].lower()
+            rest = path[2:].replace("\\", "/")
+            return f"/mnt/{drive}{rest}"
+        return path
