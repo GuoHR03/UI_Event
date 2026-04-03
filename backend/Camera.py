@@ -21,7 +21,8 @@ class CameraThread(QThread):
         self.analysis_enabled = True      # 预测开关
         self.input_path = file_path
         self.fps = fps if fps > 0 else 30
-        delta_t_us = int(nn_interval_ms * 1000)
+        self.nn_interval_us = int(nn_interval_ms * 1000)
+        delta_t_us = self.nn_interval_us
 
         # ==========================================
         # 1. 引擎分流：判断扩展名
@@ -163,28 +164,29 @@ class CameraThread(QThread):
             self._run_metavision_loop()
 
     def _run_h5_loop(self):
-        """严格按照 FPS (时间切片) 驱动的 H5 读取循环"""
+        """严格按照 nn_interval 控制推理、H5 读取循环"""
         total_events = len(self.events_dataset)
         current_idx = 0
 
         time_key = 't' if 't' in self.h5_dtypes else ('ts' if 'ts' in self.h5_dtypes else 'timestamp')
         pol_key = 'p' if 'p' in self.h5_dtypes else ('pol' if 'pol' in self.h5_dtypes else 'polarity')
 
-        # 计算一帧严格对应的时间跨度（微秒）
         frame_interval_us = int(1_000_000 / self.fps)
-        
+        nn_interval_us = self.nn_interval_us
+
         start_real_time = time.perf_counter()
         start_sensor_time = None
         next_frame_target_time = None
+        next_nn_target_time = None
 
         while self.is_running and current_idx < total_events:
             events_for_this_frame = []
-            
+
             while current_idx < total_events:
                 step = 5000
                 end_idx = min(current_idx + step, total_events)
                 raw_events = self.events_dataset[current_idx:end_idx]
-                
+
                 evs = np.zeros(len(raw_events), dtype=[('x', '<u2'), ('y', '<u2'), ('p', 'i1'), ('t', '<i8')])
                 evs['x'] = raw_events['x']
                 evs['y'] = raw_events['y']
@@ -194,52 +196,70 @@ class CameraThread(QThread):
                 if start_sensor_time is None:
                     start_sensor_time = evs['t'][0]
                     next_frame_target_time = start_sensor_time + frame_interval_us
+                    next_nn_target_time = start_sensor_time + nn_interval_us
                     start_real_time = time.perf_counter()
 
-                over_time_indices = np.where(evs['t'] >= next_frame_target_time)[0]
-                
-                if len(over_time_indices) > 0:
-                    split_idx = over_time_indices[0]
+                over_frame_time_indices = np.where(evs['t'] >= next_frame_target_time)[0]
+                over_nn_time_indices = np.where(evs['t'] >= next_nn_target_time)[0]
+
+                frame_split_idx = None
+                nn_split_idx = None
+
+                if len(over_frame_time_indices) > 0:
+                    frame_split_idx = over_frame_time_indices[0]
+                if len(over_nn_time_indices) > 0:
+                    nn_split_idx = over_nn_time_indices[0]
+
+                split_idx = frame_split_idx
+                if nn_split_idx is not None and (split_idx is None or nn_split_idx < split_idx):
+                    split_idx = nn_split_idx
+
+                if split_idx is not None:
                     events_for_this_frame.append(evs[:split_idx])
                     current_idx = current_idx + split_idx
-                    break  
+                    break
                 else:
                     events_for_this_frame.append(evs)
                     current_idx = end_idx
 
             if not events_for_this_frame:
                 break
-                
-            frame_events = np.concatenate(events_for_this_frame)
 
-            # 送去渲染
+            frame_events = np.concatenate(events_for_this_frame)
+            events_to_process = frame_events
+
+            frame_end_time = frame_events['t'][-1] if len(frame_events) > 0 else 0
+
             if len(frame_events) > 0:
                 self.event_frame_gen.process_events(frame_events)
 
-                # 实时处理：送入神经网络
-                if self.analysis_enabled and self.target_queue is not None:
-                    try:
-                        clean_array = np.column_stack((
-                            frame_events['x'], frame_events['y'], 
-                            frame_events['t'], frame_events['p']
-                        )).astype(np.float32)
-                        if self.target_queue.full():
-                            self.target_queue.get_nowait()
-                        self.target_queue.put_nowait(clean_array)
-                    except queue.Full:
-                        pass
+            if len(events_to_process) > 0 and self.analysis_enabled and self.target_queue is not None:
+                try:
+                    clean_array = np.column_stack((
+                        events_to_process['x'], events_to_process['y'],
+                        events_to_process['t'], events_to_process['p']
+                    )).astype(np.float32)
+                    if self.target_queue.full():
+                        self.target_queue.get_nowait()
+                    self.target_queue.put_nowait(clean_array)
+                except queue.Full:
+                    pass
 
-            # 严格的播放速度控制
             next_frame_target_time += frame_interval_us
-            sensor_elapsed_s = (next_frame_target_time - start_sensor_time) / 1_000_000.0
+            next_nn_target_time += nn_interval_us
+
+            target_time = min(next_frame_target_time, next_nn_target_time)
+            sensor_elapsed_s = (target_time - start_sensor_time) / 1_000_000.0
             real_elapsed_s = time.perf_counter() - start_real_time
             sleep_time = sensor_elapsed_s - real_elapsed_s
-            
+
             if sleep_time > 0.005:
                 time.sleep(sleep_time)
             elif sleep_time < -0.2:
                 start_real_time = time.perf_counter()
-                start_sensor_time = next_frame_target_time - frame_interval_us
+                start_sensor_time = frame_end_time
+                next_frame_target_time = start_sensor_time + frame_interval_us
+                next_nn_target_time = start_sensor_time + nn_interval_us
 
         if hasattr(self, 'h5_file'):
             self.h5_file.close()
@@ -249,60 +269,68 @@ class CameraThread(QThread):
 
     def _run_aedat4_loop(self):
         """AEDAT4 专属数据读取循环"""
-        start_real_time = time.perf_counter()  
+        start_real_time = time.perf_counter()
         start_sensor_time = None
-        
+
         frame_interval_us = int(1_000_000 / self.fps)
+        nn_interval_us = self.nn_interval_us
         next_frame_time = None
+        next_nn_time = None
         frame_buffer = dv.EventStore()
+        nn_buffer = dv.EventStore()
 
         while self.is_running and self.dv_reader.isRunning():
             events = self.dv_reader.getNextEventBatch()
-            
+
             if events is None:
                 print("aedat4 视频播放已结束。")
-                break  
-                
+                break
+
             if events.isEmpty():
-                continue  
+                continue
 
             arr = events.numpy()
 
             if start_sensor_time is None:
                 start_sensor_time = arr['timestamp'][0]
                 next_frame_time = start_sensor_time + frame_interval_us
+                next_nn_time = start_sensor_time + nn_interval_us
 
-            # 实时处理：送入神经网络
-            if self.analysis_enabled and self.target_queue is not None:
-                try:
-                    clean_array = np.column_stack((
-                        arr['x'], arr['y'], arr['timestamp'], arr['polarity']
-                    )).astype(np.float32)
-                    
-                    if self.target_queue.full():
-                        self.target_queue.get_nowait()
-                    self.target_queue.put_nowait(clean_array)
-                except queue.Full:
-                    pass
-
-            # UI显示：累积事件生成画面
             frame_buffer.add(events)
+            nn_buffer.add(events)
+
+            if arr['timestamp'][-1] >= next_nn_time:
+                if self.analysis_enabled and self.target_queue is not None:
+                    try:
+                        nn_arr = nn_buffer.numpy()
+                        clean_array = np.column_stack((
+                            nn_arr['x'], nn_arr['y'], nn_arr['timestamp'], nn_arr['polarity']
+                        )).astype(np.float32)
+
+                        if self.target_queue.full():
+                            self.target_queue.get_nowait()
+                        self.target_queue.put_nowait(clean_array)
+                    except queue.Full:
+                        pass
+                nn_buffer = dv.EventStore()
+                next_nn_time += nn_interval_us
+
             if arr['timestamp'][-1] >= next_frame_time:
                 image_bgr = self.dv_visualizer.generateImage(frame_buffer)
                 image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-                
+
                 if self.is_running:
                     self.image_signal.emit(image_rgb.copy())
-                    
+
                 frame_buffer = dv.EventStore()
                 next_frame_time = arr['timestamp'][-1] + frame_interval_us
 
-            # 速度控制
             current_sensor_time = arr['timestamp'][-1]
-            sensor_elapsed_s = (current_sensor_time - start_sensor_time) / 1_000_000.0
+            target_time = min(next_frame_time, next_nn_time)
+            sensor_elapsed_s = (target_time - start_sensor_time) / 1_000_000.0
             real_elapsed_s = time.perf_counter() - start_real_time
             time_diff = sensor_elapsed_s - real_elapsed_s
-            
+
             if time_diff > 0:
                 time.sleep(time_diff)
             elif time_diff < -0.2:
