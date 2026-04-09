@@ -57,13 +57,15 @@ class MainWindow(QWidget):
 
         # 变量
         self.backend = BackendAPI()
-        self.backend.image_signal.connect(self.update_image)
-        self.backend.prediction_signal.connect(self.update_prediction_ui)
+        self.backend.image_signal.connect(self._display_image_with_prediction)
+        self.backend.prediction_signal.connect(self._buffer_prediction_result)
         self.backend.playback_finished_signal.connect(self.on_playback_finished)
         self.file_path = None
         self.pt_path = None
         self.last_pred = None
         self.last_pred_mode = None
+        self.prediction_buffer = {}
+        self.nn_interval_ms = 20
 
     def toggle_camera(self):
         """相机启动链接的槽"""
@@ -86,21 +88,40 @@ class MainWindow(QWidget):
                 self.record_btn.setText("开始录制")
                 self.record_btn.setStyleSheet("")
 
-    def update_image(self, cv_img):
+    def _display_image_with_prediction(self, cv_img, img_timestamp):
         if len(cv_img.shape) == 3:
-            """RGB"""
             height, width, channel = cv_img.shape
             bytes_per_line = channel * width
             img_format = QImage.Format.Format_BGR888
         else:
-            """Gray"""
             height, width = cv_img.shape
             bytes_per_line = width
             img_format = QImage.Format.Format_Grayscale8
 
+        frame_end_time = img_timestamp
+        frame_start_time = frame_end_time - int(self.nn_interval_ms * 1000)
+
+        matched_pred = None
+        matched_mode = None
+        matched_cropped = False
+        for ts_key in sorted(self.prediction_buffer.keys()):
+            if frame_start_time <= ts_key <= frame_end_time:
+                matched_pred, matched_mode, matched_cropped = self.prediction_buffer[ts_key]
+                break
+        if matched_pred is None:
+            for ts_key in sorted(self.prediction_buffer.keys()):
+                if ts_key <= frame_end_time:
+                    matched_pred, matched_mode, matched_cropped = self.prediction_buffer[ts_key]
+                else:
+                    break
+
+        for ts_key in list(self.prediction_buffer.keys()):
+            if ts_key < frame_end_time - 200000:
+                del self.prediction_buffer[ts_key]
+
         q_img = QImage(cv_img.data, width, height, bytes_per_line, img_format)
-        if self.last_pred is not None:
-            px, py = self._map_pred_to_pixel(width, height)
+        if matched_pred is not None:
+            px, py = self._map_pred_to_pixel(matched_pred, matched_mode, width, height)
             if px is not None and py is not None:
                 painter = QPainter(q_img)
                 pen = QPen(QColor(255, 0, 0))
@@ -115,8 +136,40 @@ class MainWindow(QWidget):
             self.image_label.size(),
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.FastTransformation
-            #Qt.TransformationMode.SmoothTransformation
         ))
+
+    def _buffer_prediction_result(self, result, pred_timestamp):
+        self.textEdit.append(result)
+
+        if not isinstance(result, str):
+            return
+        marker = "输出结果为："
+        if marker not in result:
+            return
+        parts = result.split(marker, 1)[1].strip()
+        is_cropped = False
+        if "|cropped:" in parts:
+            main_part, cropped_part = parts.rsplit("|cropped:", 1)
+            is_cropped = cropped_part.strip().lower() == "true"
+            payload = main_part.strip()
+        else:
+            payload = parts
+        try:
+            values = ast.literal_eval(payload)
+        except Exception:
+            return
+        if not isinstance(values, (list, tuple)) or len(values) < 2:
+            return
+        x, y = values[0], values[1]
+        if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+            return
+        pred_data = (float(x), float(y))
+        if 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0:
+            pred_mode = "norm"
+        else:
+            pred_mode = "pixel"
+        self.prediction_buffer[pred_timestamp] = (pred_data, pred_mode, is_cropped)
+        self.last_pred = pred_data
 
     def closeEvent(self, event):
         """关闭程序"""
@@ -129,12 +182,6 @@ class MainWindow(QWidget):
             self.toggle_camera() # 停止旧相机
             QApplication.processEvents()
             self.toggle_camera() # 带着新选的颜色重新启动相机
-
-    def update_prediction_ui(self,result):
-        """更新网络输出到UI文本框"""
-        self.textEdit.append(result)
-        self._update_last_prediction(result)
-        #self.textEdit.setText(result)
 
     #  从这里继续查代码
     def on_playback_finished(self):
@@ -199,33 +246,11 @@ class MainWindow(QWidget):
         self.last_pred = None
         self.last_pred_mode = None
 
-    def _update_last_prediction(self, result):
-        if not isinstance(result, str):
-            return
-        marker = "输出结果为："
-        if marker not in result:
-            return
-        payload = result.split(marker, 1)[1].strip()
-        try:
-            values = ast.literal_eval(payload)
-        except Exception:
-            return
-        if not isinstance(values, (list, tuple)) or len(values) < 2:
-            return
-        x, y = values[0], values[1]
-        if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
-            return
-        self.last_pred = (float(x), float(y))
-        if 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0:
-            self.last_pred_mode = "norm"
-        else:
-            self.last_pred_mode = "pixel"
-
-    def _map_pred_to_pixel(self, width, height):
-        if self.last_pred is None:
+    def _map_pred_to_pixel(self, pred, pred_mode, width, height):
+        if pred is None:
             return None, None
-        x, y = self.last_pred
-        if self.last_pred_mode == "norm":
+        x, y = pred
+        if pred_mode == "norm":
             px = int(x * width)
             py = int(y * height)
         else:

@@ -1,161 +1,269 @@
+# 通过队列去成像和预测
+
 import time
 import queue
 import cv2
 import numpy as np
-import dv_processing as dv  
+import dv_processing as dv
 import h5py
-from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import QThread, pyqtSignal, QObject
 from metavision_core.event_io.raw_reader import initiate_device
 from metavision_core.event_io import EventsIterator
 from metavision_sdk_core import PeriodicFrameGenerationAlgorithm, ColorPalette
 
-class CameraThread(QThread):
-    image_signal = pyqtSignal(object)
+
+def downSampling_cropping_and_normalization(data_numpy, src_width=640, src_height=480, dst_width=512, dst_height=512):
+    """进行下采样+裁剪+归一化,适用于ini30数据集
+    裁剪区域: x: [96, 608], y: [-16, 496] (实际有效)
+    输出尺寸: 512x512
+    """
+    x_raw = data_numpy[:, 0] * (640.0 / src_width)
+    y_raw = data_numpy[:, 1] * (480.0 / src_height)
+    x_raw = np.clip(x_raw, 0, 640 - 1)
+    y_raw = np.clip(y_raw, 0, 480 - 1)
+
+    # 裁剪 512 * 512
+    mask = (x_raw >= 96) & (x_raw <= 608)
+    x_values = x_raw[mask] - 96
+    y_values = y_raw[mask] + 16
+    t_values = data_numpy[:, 2][mask]
+
+    x_values = np.clip(x_values, 0, dst_width - 1)
+    y_values = np.clip(y_values, 0, dst_height - 1)
+
+    # 归一化
+    x_values = x_values / dst_width
+    y_values = y_values / dst_height
+    t_max = t_values.max()
+    t_min = t_values.min()
+    t_values = (t_values - t_min) / (t_max - t_min + 1e-5)
+    # t_values = t_values * 0.1
+    return x_values, y_values, t_values
+
+
+def downSampling_and_normalization(data_numpy, src_width=640, src_height=480, dst_width=640, dst_height=480):
+    """进行下采样+归一化，适用于seet数据集
+    输出尺寸: dst_width x dst_height
+    """
+    x_values = data_numpy[:, 0] * (dst_width / src_width)
+    y_values = data_numpy[:, 1] * (dst_height / src_height)
+    t_values = data_numpy[:, 2]
+    x_values = np.clip(x_values, 0, dst_width - 1)
+    y_values = np.clip(y_values, 0, dst_height - 1)
+    x_values = x_values / dst_width
+    y_values = y_values / dst_height
+
+    t_max = t_values.max()
+    t_min = t_values.min()
+    t_values = (t_values - t_min) / (t_max - t_min + 1e-5)
+    #t_values = t_values * 0.1
+    return x_values, y_values, t_values
+
+
+class NNWorker(QThread):
+    """神经网络推理线程 - 独立按 nn_interval 发送推理"""
     finished_signal = pyqtSignal()
 
-    def __init__(self, palette_type="Dark", fps=30, nn_interval_ms=20, target_queue=None, file_path=""): 
+    def __init__(self, nn_queue, nn_interval_us, width, height, target_queue, analysis_enabled):
+        super().__init__()
+        self.nn_queue = nn_queue
+        self.nn_interval_us = nn_interval_us
+        self.width = width
+        self.height = height
+        self.target_queue = target_queue
+        self.analysis_enabled = analysis_enabled
+        self.is_running = True
+
+    def run(self):
+        buffer = []
+        next_nn_time = None
+
+        while self.is_running:
+            try:
+                events = self.nn_queue.get(timeout=0.001)
+            except queue.Empty:
+                continue
+
+            if 'timestamp' in events.dtype.names and 't' not in events.dtype.names:
+                # 转换为t字段
+                old_dtype = events.dtype
+                new_fields = []
+                for name in old_dtype.names:
+                    field_type = old_dtype.fields[name][0]
+                    new_name = 't' if name == 'timestamp' else name
+                    new_fields.append((new_name, field_type))
+                new_dtype = np.dtype(new_fields)
+                new_events = np.zeros(len(events), dtype=new_dtype)
+                for name in old_dtype.names:
+                    new_name = 't' if name == 'timestamp' else name
+                    new_events[new_name] = events[name]
+                events = new_events
+
+            buffer.append(events)
+
+            if next_nn_time is None:
+                next_nn_time = events['t'][-1] + self.nn_interval_us
+                continue
+
+            if events['t'][-1] >= next_nn_time:
+                if buffer and self.target_queue is not None and self.analysis_enabled():
+                    try:
+                        nn_events = np.concatenate(buffer)
+                        nn_events = np.column_stack((nn_events['x'], nn_events['y'], nn_events['t']))
+
+                        x_norm, y_norm, t_norm = downSampling_and_normalization(
+                             nn_events, src_width=self.width, src_height=self.height
+                        )
+
+                        target_points = 1024
+                        if len(x_norm) < target_points:
+                            buffer = []
+                            next_nn_time += self.nn_interval_us
+                            continue
+                        if len(x_norm) > target_points:
+                            indices = np.linspace(0, len(x_norm) - 1, target_points, dtype=int)
+                            x_norm = x_norm[indices]
+                            y_norm = y_norm[indices]
+                            t_norm = t_norm[indices]
+
+                        clean_array = np.column_stack((x_norm, y_norm, t_norm)).astype(np.float32)
+
+                        if self.target_queue.full():
+                            self.target_queue.get_nowait()
+                        self.target_queue.put_nowait({
+                            "msg_type": "EVENTS",
+                            "data": clean_array,
+                        })
+                    except queue.Full:
+                        pass
+
+                buffer = []
+                next_nn_time += self.nn_interval_us
+
+        self.finished_signal.emit()
+
+
+class CameraThread(QThread):
+    """事件读取线程 - 读取事件并分发放到两个队列"""
+    finished_signal = pyqtSignal()
+
+    def __init__(self, palette_type="Dark", fps=30, nn_interval_ms=20, target_queue=None, file_path=""):
         super().__init__()
         self.is_running = True
         self.is_recording = False
-        self.target_queue = target_queue  # 预测线程的输入管道
-        self.analysis_enabled = True      # 预测开关
+        self.target_queue = target_queue
+        self.analysis_enabled = True
         self.input_path = file_path
+        self.palette_type = palette_type
         self.fps = fps if fps > 0 else 30
         self.nn_interval_us = int(nn_interval_ms * 1000)
-        delta_t_us = self.nn_interval_us
+        self.width = 640
+        self.height = 480
 
-        # ==========================================
-        # 1. 引擎分流：判断扩展名
-        # ==========================================
         self.is_aedat4 = self.input_path and self.input_path.lower().endswith(".aedat4")
         self.is_h5 = self.input_path and self.input_path.lower().endswith(('.h5', '.hdf5'))
 
+        self.nn_queue = queue.Queue(maxsize=10)
+
+        self.nn_worker = None
+
+        self._init_engine(palette_type)
+
+    def _on_cd_frame_cb(self, ts, frame):
+        self.image_signal.emit(frame.copy(), int(ts))
+
+    def _init_engine(self, palette_type):
         if self.is_aedat4:
-            # ---------------- 【AEDAT4 引擎初始化】 ----------------
-            self.device = None  # aedat4 回放模式不支持 raw 录制
+            # aedat4 调色盘初始化
+            self.device = None
             self.dv_reader = dv.io.MonoCameraRecording(self.input_path)
-            
+
             try:
                 res = self.dv_reader.getEventResolution()
                 self.width, self.height = res.width, res.height
             except:
                 self.width, self.height = 640, 480
-                
+
             self.dv_visualizer = dv.visualization.EventVisualizer((self.width, self.height))
-            
-        if self.is_aedat4:
-            # ---------------- 【模仿彩色 Metavision 官方风格调色板】 ----------------
-            if palette_type == "Light":
-                # 背景白，正极黑，负极白(隐形)
-                self.dv_visualizer.setBackgroundColor((255.0, 255.0, 255.0)) 
-                self.dv_visualizer.setPositiveColor((0.0, 0.0, 0.0))       
-                self.dv_visualizer.setNegativeColor((255.0, 255.0, 255.0))       
-            elif palette_type == "Gray":
-                # 背景灰，正极白，负极黑
-                self.dv_visualizer.setBackgroundColor((128.0, 128.0, 128.0)) 
-                self.dv_visualizer.setPositiveColor((255.0, 255.0, 255.0))   
-                self.dv_visualizer.setNegativeColor((0.0, 0.0, 0.0))         
-            elif palette_type == "CoolWarm":
-                # 保留彩色冷暖色：背景暗灰，正极暖橙红，负极冷深蓝
-                self.dv_visualizer.setBackgroundColor((30.0, 30.0, 30.0))    
-                self.dv_visualizer.setPositiveColor((0.0, 128.0, 255.0))     
-                self.dv_visualizer.setNegativeColor((255.0, 100.0, 0.0))     
-            else: # Dark / 默认
-                # 【关键修复】从 Ground Truth 中精确采样的红蓝彩色版
-                # 背景色：采样为 #1C2433 (深海军灰)
-                self.dv_visualizer.setBackgroundColor((28.0, 36.0, 51.0)) 
-                # 正极事件：纯白 (White)
-                self.dv_visualizer.setPositiveColor((255.0, 255.0, 255.0))   
-                # 负极事件：采样为 #0066CC (深蓝色)
-                self.dv_visualizer.setNegativeColor((0.0, 102.0, 204.0))
+
+            palette_rgb_map = {
+                "Dark": {
+                    "bg": (30, 37, 52),
+                    "pos": (255, 255, 255),
+                    "neg": (64, 126, 200)
+                },
+                "Light": {
+                    "bg": (255, 255, 255),
+                    "pos": (64, 126, 200),
+                    "neg": (30, 37, 52)
+                },
+                "CoolWarm": {
+                    "bg": (217, 224, 237),
+                    "pos": (255, 113, 117),
+                    "neg": (87, 123, 198)
+                },
+                "Gray": {
+                    "bg": (128, 128, 128),
+                    "pos": (255, 255, 255),
+                    "neg": (0, 0, 0)
+                }
+            }
+            rgb = palette_rgb_map.get(palette_type, palette_rgb_map["Dark"])
+            self.dv_visualizer.setBackgroundColor(rgb["bg"])
+            self.dv_visualizer.setPositiveColor(rgb["pos"])
+            self.dv_visualizer.setNegativeColor(rgb["neg"])
 
         elif self.is_h5:
-            # ---------------- 【HDF5 引擎初始化】 ----------------
             self.device = None
             self.h5_file = h5py.File(self.input_path, 'r')
             self.events_dataset = self.h5_file['events']
             self.h5_dtypes = self.events_dataset.dtype.names
-            
-            # 尝试从属性读取分辨率，读不到就给一个默认值
-            self.width = self.h5_file.attrs.get('width', 1280)
-            self.height = self.h5_file.attrs.get('height', 800)
+
+            self.width = self.h5_file.attrs.get('width', 640)
+            self.height = self.h5_file.attrs.get('height', 480)
 
             palette_map = {
                 "Dark": ColorPalette.Dark, "Light": ColorPalette.Light,
                 "CoolWarm": ColorPalette.CoolWarm, "Gray": ColorPalette.Gray
             }
             palette = palette_map.get(palette_type, ColorPalette.Dark)
-
             self.event_frame_gen = PeriodicFrameGenerationAlgorithm(
                 sensor_width=self.width, sensor_height=self.height, fps=self.fps, palette=palette)
             self.event_frame_gen.set_output_callback(self._on_cd_frame_cb)
 
         else:
-            # ---------------- 【Metavision 引擎初始化】 ----------------
+            # metavision 调色盘初始化
             try:
                 self.device = initiate_device("")
-                self.mv_iterator = EventsIterator.from_device(device=self.device, delta_t=delta_t_us)
+                self.mv_iterator = EventsIterator.from_device(device=self.device, delta_t=self.nn_interval_us)
             except:
                 self.device = None
-                self.mv_iterator = EventsIterator(input_path=self.input_path, delta_t=delta_t_us)
-            
+                self.mv_iterator = EventsIterator(input_path=self.input_path, delta_t=self.nn_interval_us)
+
             self.height, self.width = self.mv_iterator.get_size()
-            
+
             palette_map = {
                 "Dark": ColorPalette.Dark, "Light": ColorPalette.Light,
                 "CoolWarm": ColorPalette.CoolWarm, "Gray": ColorPalette.Gray
             }
             palette = palette_map.get(palette_type, ColorPalette.Dark)
-
             self.event_frame_gen = PeriodicFrameGenerationAlgorithm(
                 sensor_width=self.width, sensor_height=self.height, fps=self.fps, palette=palette)
             self.event_frame_gen.set_output_callback(self._on_cd_frame_cb)
 
-        # ==========================================
-        # 2. 发送公共配置包
-        # ==========================================
-        if self.target_queue is not None:
-            config_payload = {
-                "msg_type": "CONFIG",
-                "width": self.width,
-                "height": self.height
-            }
-            while not self.target_queue.empty():
-                try:
-                    self.target_queue.get_nowait()
-                except queue.Empty:
-                    break
-            try:
-                self.target_queue.put_nowait(config_payload)
-            except queue.Full:
-                print("无法传入相机参数")
+    def _start_workers(self, palette_type):
+        self.nn_worker = NNWorker(
+            self.nn_queue, self.nn_interval_us, self.width, self.height,
+            self.target_queue, lambda: self.analysis_enabled
+        )
+        self.nn_worker.start()
 
-    def _on_cd_frame_cb(self, ts, cd_frame):
-        """Metavision 算法生成图像后的回调"""
-        if self.is_running:
-            self.image_signal.emit(cd_frame.copy())
-
-    def start_recording(self):
-        if self.device is not None:  
-            i_events_stream = self.device.get_i_events_stream()
-            if i_events_stream:
-                timestamp = time.strftime("%Y%m%d_%H%M%S")
-                filename = f"recording_{timestamp}.raw"
-                i_events_stream.log_raw_data(filename)
-                self.is_recording = True
-                print(f"开始录制原始数据: {filename}")
-
-    def stop_recording(self):
-        """停止 RAW 录制信号"""
-        if self.device is not None:
-            i_events_stream = self.device.get_i_events_stream()
-            if i_events_stream:
-                i_events_stream.stop_log_raw_data()
-                self.is_recording = False
-                print("停止录制并保存文件")
+    def _on_worker_finished(self):
+        self.is_running = False
 
     def run(self):
-        # 根据当前模式，路由到对应的运行循环
+        self._start_workers(self.palette_type)
+
         if self.is_aedat4:
             self._run_aedat4_loop()
         elif self.is_h5:
@@ -163,8 +271,14 @@ class CameraThread(QThread):
         else:
             self._run_metavision_loop()
 
+        self.is_running = False
+        if self.nn_worker:
+            self.nn_worker.is_running = False
+            self.nn_worker.wait()
+
+        self.finished_signal.emit()
+
     def _run_h5_loop(self):
-        """严格按照 nn_interval 控制推理、H5 读取循环"""
         total_events = len(self.events_dataset)
         current_idx = 0
 
@@ -172,12 +286,9 @@ class CameraThread(QThread):
         pol_key = 'p' if 'p' in self.h5_dtypes else ('pol' if 'pol' in self.h5_dtypes else 'polarity')
 
         frame_interval_us = int(1_000_000 / self.fps)
-        nn_interval_us = self.nn_interval_us
-
         start_real_time = time.perf_counter()
         start_sensor_time = None
         next_frame_target_time = None
-        next_nn_target_time = None
 
         while self.is_running and current_idx < total_events:
             events_for_this_frame = []
@@ -196,25 +307,12 @@ class CameraThread(QThread):
                 if start_sensor_time is None:
                     start_sensor_time = evs['t'][0]
                     next_frame_target_time = start_sensor_time + frame_interval_us
-                    next_nn_target_time = start_sensor_time + nn_interval_us
                     start_real_time = time.perf_counter()
 
-                over_frame_time_indices = np.where(evs['t'] >= next_frame_target_time)[0]
-                over_nn_time_indices = np.where(evs['t'] >= next_nn_target_time)[0]
+                over_time_indices = np.where(evs['t'] >= next_frame_target_time)[0]
 
-                frame_split_idx = None
-                nn_split_idx = None
-
-                if len(over_frame_time_indices) > 0:
-                    frame_split_idx = over_frame_time_indices[0]
-                if len(over_nn_time_indices) > 0:
-                    nn_split_idx = over_nn_time_indices[0]
-
-                split_idx = frame_split_idx
-                if nn_split_idx is not None and (split_idx is None or nn_split_idx < split_idx):
-                    split_idx = nn_split_idx
-
-                if split_idx is not None:
+                if len(over_time_indices) > 0:
+                    split_idx = over_time_indices[0]
                     events_for_this_frame.append(evs[:split_idx])
                     current_idx = current_idx + split_idx
                     break
@@ -226,30 +324,39 @@ class CameraThread(QThread):
                 break
 
             frame_events = np.concatenate(events_for_this_frame)
-            events_to_process = frame_events
-
-            frame_end_time = frame_events['t'][-1] if len(frame_events) > 0 else 0
 
             if len(frame_events) > 0:
                 self.event_frame_gen.process_events(frame_events)
 
-            if len(events_to_process) > 0 and self.analysis_enabled and self.target_queue is not None:
-                try:
-                    clean_array = np.column_stack((
-                        events_to_process['x'], events_to_process['y'],
-                        events_to_process['t'], events_to_process['p']
-                    )).astype(np.float32)
-                    if self.target_queue.full():
-                        self.target_queue.get_nowait()
-                    self.target_queue.put_nowait(clean_array)
-                except queue.Full:
-                    pass
+                if self.analysis_enabled and self.target_queue is not None:
+                    try:
+                        nn_events = np.column_stack((
+                            frame_events['x'], frame_events['y'], frame_events['t']
+                        ))
+
+                        x_norm, y_norm, t_norm = downSampling_and_normalization(
+                            nn_events, src_width=self.width, src_height=self.height
+                        )
+
+                        target_points = 1024
+                        if len(x_norm) >= target_points:
+                            indices = np.linspace(0, len(x_norm) - 1, target_points, dtype=int)
+                            x_norm = x_norm[indices]
+                            y_norm = y_norm[indices]
+                            t_norm = t_norm[indices]
+
+                            clean_array = np.column_stack((x_norm, y_norm, t_norm)).astype(np.float32)
+                            if self.target_queue.full():
+                                self.target_queue.get_nowait()
+                            self.target_queue.put_nowait({
+                                "msg_type": "EVENTS",
+                                "data": clean_array,
+                            })
+                    except queue.Full:
+                        pass
 
             next_frame_target_time += frame_interval_us
-            next_nn_target_time += nn_interval_us
-
-            target_time = min(next_frame_target_time, next_nn_target_time)
-            sensor_elapsed_s = (target_time - start_sensor_time) / 1_000_000.0
+            sensor_elapsed_s = (next_frame_target_time - start_sensor_time) / 1_000_000.0
             real_elapsed_s = time.perf_counter() - start_real_time
             sleep_time = sensor_elapsed_s - real_elapsed_s
 
@@ -257,131 +364,145 @@ class CameraThread(QThread):
                 time.sleep(sleep_time)
             elif sleep_time < -0.2:
                 start_real_time = time.perf_counter()
-                start_sensor_time = frame_end_time
-                next_frame_target_time = start_sensor_time + frame_interval_us
-                next_nn_target_time = start_sensor_time + nn_interval_us
+                start_sensor_time = next_frame_target_time - frame_interval_us
 
         if hasattr(self, 'h5_file'):
             self.h5_file.close()
 
-        if self.is_running:
-            self.finished_signal.emit()
-
+    
     def _run_aedat4_loop(self):
-        """AEDAT4 专属数据读取循环"""
+    # 第一帧不受fps间隔限制，而是第一个事件包里面所有事件进行成像处理
+        # ======== 1. UI 渲染变量 (约 33.3ms) ========
+        frame_buffer = dv.EventStore()
+        next_frame_time = None
+        frame_interval_us = int(1_000_000 / self.fps)
+        
+        # ======== 2. 神经网络变量 (精准 20.0ms) ========
+        nn_buffer = []
+        next_nn_time = None
+
+        # ======== 3. 真实播放速度控制变量 ========
         start_real_time = time.perf_counter()
         start_sensor_time = None
-
-        frame_interval_us = int(1_000_000 / self.fps)
-        nn_interval_us = self.nn_interval_us
-        next_frame_time = None
-        next_nn_time = None
-        frame_buffer = dv.EventStore()
-        nn_buffer = dv.EventStore()
 
         while self.is_running and self.dv_reader.isRunning():
             events = self.dv_reader.getNextEventBatch()
 
             if events is None:
-                print("aedat4 视频播放已结束。")
                 break
-
             if events.isEmpty():
                 continue
 
+            # aedat4 的专有格式：EventStore 喂给画面，Numpy 喂给网络
+            frame_buffer.add(events)
             arr = events.numpy()
-
+            
+            # 初始化所有秒表
             if start_sensor_time is None:
                 start_sensor_time = arr['timestamp'][0]
                 next_frame_time = start_sensor_time + frame_interval_us
-                next_nn_time = start_sensor_time + nn_interval_us
+                next_nn_time = start_sensor_time + self.nn_interval_us
+                start_real_time = time.perf_counter()
 
-            frame_buffer.add(events)
-            nn_buffer.add(events)
+            nn_buffer.append(arr)
 
-            if arr['timestamp'][-1] >= next_nn_time:
-                if self.analysis_enabled and self.target_queue is not None:
-                    try:
-                        nn_arr = nn_buffer.numpy()
-                        clean_array = np.column_stack((
-                            nn_arr['x'], nn_arr['y'], nn_arr['timestamp'], nn_arr['polarity']
-                        )).astype(np.float32)
-
-                        if self.target_queue.full():
-                            self.target_queue.get_nowait()
-                        self.target_queue.put_nowait(clean_array)
-                    except queue.Full:
-                        pass
-                nn_buffer = dv.EventStore()
-                next_nn_time += nn_interval_us
-
+            # ---------------------------------------------------------
+            # 任务 A：UI 画面渲染 (攒够帧率对应的时间出图)
+            # ---------------------------------------------------------
             if arr['timestamp'][-1] >= next_frame_time:
                 image_bgr = self.dv_visualizer.generateImage(frame_buffer)
                 image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
 
                 if self.is_running:
-                    self.image_signal.emit(image_rgb.copy())
+                    self.image_signal.emit(image_rgb.copy(), int(arr['timestamp'][-1]))
 
                 frame_buffer = dv.EventStore()
-                next_frame_time = arr['timestamp'][-1] + frame_interval_us
+                # 更新下一帧的目标时间
+                next_frame_time += frame_interval_us
 
-            current_sensor_time = arr['timestamp'][-1]
-            target_time = min(next_frame_time, next_nn_time)
-            sensor_elapsed_s = (target_time - start_sensor_time) / 1_000_000.0
-            real_elapsed_s = time.perf_counter() - start_real_time
-            time_diff = sensor_elapsed_s - real_elapsed_s
+            # ---------------------------------------------------------
+            # 任务 B：神经网络精准切割 (严格按 20ms 步进)
+            # ---------------------------------------------------------
+            if arr['timestamp'][-1] >= next_nn_time:
+                # 把零碎的数据拼成大段
+                buffer_events = np.concatenate(nn_buffer)
 
-            if time_diff > 0:
-                time.sleep(time_diff)
-            elif time_diff < -0.2:
-                start_real_time = time.perf_counter()
-                start_sensor_time = current_sensor_time
+                # 只要剩余数据的最新时间戳 >= 20ms 的目标时间，就一直切！
+                while len(buffer_events) > 0 and buffer_events['timestamp'][-1] >= next_nn_time:
+                    # 使用 searchsorted 找到刚好等于或略微超过 20ms 的那条数据索引
+                    split_idx = np.searchsorted(buffer_events['timestamp'], next_nn_time)
+                    
+                    # 🔪 手起刀落，切出极其精准的 20ms 事件段！
+                    nn_chunk = buffer_events[:split_idx]
 
-        if self.is_running:
-            self.finished_signal.emit()
+                    if len(nn_chunk) > 0 and self.analysis_enabled and self.nn_queue is not None:
+                        try:
+                            # 阻塞模式，死等 NNWorker，坚决不丢弃一丝眼动数据！
+                            self.nn_queue.put(nn_chunk, timeout=1.0)
+                        except queue.Full:
+                            print("警告：aedat4 回放中，NNWorker 矩阵运算速度滞后！")
+
+                    # 切割剩下的数据，留给下一次循环
+                    buffer_events = buffer_events[split_idx:]
+                    
+                    # ======== 任务 C：真实时间同步 (在切割点控制速度) ========
+                    sensor_elapsed_s = (next_nn_time - start_sensor_time) / 1_000_000.0
+                    real_elapsed_s = time.perf_counter() - start_real_time
+                    sleep_time = sensor_elapsed_s - real_elapsed_s
+
+                    if sleep_time > 0.005:
+                        time.sleep(sleep_time) # 播太快了，等一下真实世界
+                    elif sleep_time < -0.2:
+                        # 电脑太卡严重滞后，重新对齐时间轴
+                        start_real_time = time.perf_counter()
+                        start_sensor_time = next_nn_time
+
+                    # 更新网络预测的下一个 20ms 目标
+                    next_nn_time += self.nn_interval_us
+
+                # 把剩下的尾巴重新塞回缓冲桶
+                nn_buffer = [buffer_events] if len(buffer_events) > 0 else []
+
+        # 读取完毕后，稍微等待 NNWorker 消化完队列里的最后一批数据
+        while not self.nn_queue.empty() and self.is_running:
+            time.sleep(0.05)
 
     def _run_metavision_loop(self):
-        """Metavision 原有的数据读取循环"""
-        start_real_time = time.time()
-        start_sensor_time = None
-
         for evs in self.mv_iterator:
             if not self.is_running:
                 break
 
-            if evs.size > 0 and start_sensor_time is None:
-                start_sensor_time = evs['t'][0]
+            if len(evs) == 0:
+                continue
 
-            # 1. UI显示
             self.event_frame_gen.process_events(evs)
 
-            # 2. 实时处理
-            if self.analysis_enabled and self.target_queue is not None:
-                if evs.size > 0:
-                    try:
-                        clean_array = np.column_stack((
-                            evs['x'], evs['y'], evs['t'], evs['p']
-                        )).astype(np.float32)
-                        if self.target_queue.full():
-                            self.target_queue.get_nowait()
-                        self.target_queue.put_nowait(clean_array)
-                    except queue.Full:
-                        pass
-            
-            # 速度控制
-            if self.device is None and evs.size > 0 and start_sensor_time is not None:
-                current_sensor_time = evs['t'][-1]
-                sensor_elapsed_s = (current_sensor_time - start_sensor_time) / 1000000.0
-                real_elapsed_s = time.time() - start_real_time
-                time_diff = sensor_elapsed_s - real_elapsed_s
-                if time_diff > 0:
-                    time.sleep(time_diff)
-
-        if self.is_running:
-            self.finished_signal.emit()
+            try:
+                self.nn_queue.put_nowait(evs)
+            except queue.Full:
+                try:
+                    self.nn_queue.get_nowait()
+                    self.nn_queue.put_nowait(evs)
+                except:
+                    pass
 
     def stop(self):
         self.is_running = False
-        if self.is_recording:
-            self.is_recording = False
-            self.stop_recording()
+
+    def start_recording(self):
+        if self.device is not None:
+            i_events_stream = self.device.get_i_events_stream()
+            if i_events_stream:
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                i_events_stream.start_log_raw_data(f"recording_{timestamp}.raw")
+                self.is_recording = True
+
+    def stop_recording(self):
+        if self.device is not None:
+            i_events_stream = self.device.get_i_events_stream()
+            if i_events_stream:
+                i_events_stream.stop_log_raw_data()
+                self.is_recording = False
+
+    image_signal = pyqtSignal(object, int)
+    finished_signal = pyqtSignal()  

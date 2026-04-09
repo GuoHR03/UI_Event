@@ -4,7 +4,7 @@ import zmq
 from PyQt6.QtCore import QThread, pyqtSignal
 
 class NetworkThread(QThread):
-    result_signal = pyqtSignal(str)
+    result_signal = pyqtSignal(str, int)
 
     def __init__(self, input_queue, host="127.0.0.1", port=5555):
         super().__init__()
@@ -28,9 +28,13 @@ class NetworkThread(QThread):
                 if data is None:
                     data = self.input_queue.get(timeout=1.0)
 
+                timestamp = 0
+                if isinstance(data, dict) and "timestamp" in data:
+                    timestamp = data["timestamp"]
+
                 self.socket.send_pyobj(data)
                 result = self.socket.recv_string()
-                self.result_signal.emit(result)
+                self.result_signal.emit(result, timestamp)
 
             except queue.Empty:
                 continue

@@ -9,8 +9,8 @@ from backend.NetworkThread import NetworkThread
 
 
 class BackendAPI(QObject):
-    image_signal = pyqtSignal(object)
-    prediction_signal = pyqtSignal(str)
+    image_signal = pyqtSignal(object, int)
+    prediction_signal = pyqtSignal(str, int)
     playback_finished_signal = pyqtSignal()
 
     def __init__(self):

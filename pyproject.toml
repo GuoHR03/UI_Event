@@ -1,16 +1,29 @@
 [project]
+
 name = "PySide Project"
 
+
+
 [tool.pyside6-project]
-# 在这里列出所有需要显示和使用的文件及文件夹
+
 files = [
+
     ".gitignore",
+
     "app",
+
     "backend",
+
     "libs/",
+
     "app/form.ui",
+
     "app/widget.py",
+
     "app/choose_windows.py",
+
     "app/choose_form.ui",
+
     "linux_backend.py",
+
 ]

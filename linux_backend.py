@@ -33,13 +33,17 @@ class InferenceServer:
         while self.running:
             try:
                 data = self.socket.recv_pyobj()
-
                 if isinstance(data, dict) and data.get("msg_type") == "CONFIG":
                     result_text = self.model.process_data(data)
                     self.socket.send_string(result_text)
                     continue
 
-                result_text = self.model.process_data(data)
+                if isinstance(data, dict) and "data" in data:
+                    inference_data = data["data"]
+                else:
+                    inference_data = data
+
+                result_text = self.model.process_data(inference_data)
                 self.socket.send_string(result_text)
 
             except Exception as e:
@@ -58,7 +62,7 @@ class InferenceServer:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="EventMamba Linux Backend Server")
-    parser.add_argument("--weights", type=str, required=True, help="模型 .pt 权重文件的路径")
+    parser.add_argument("--weights", type=str, required=True, help="模型 .pt(.pth) 权重文件的路径")
     parser.add_argument("--port", type=int, default=5555, help="ZMQ 绑定的端口号")
     args = parser.parse_args()
     server = InferenceServer(weight_path=args.weights, port=args.port)
