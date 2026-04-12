@@ -125,8 +125,10 @@ class NNWorker(QThread):
                             x_norm = x_norm[indices]
                             y_norm = y_norm[indices]
                             t_norm = t_norm[indices]
+                            t_norm = t_norm * 0.1
 
-                        clean_array = np.column_stack((x_norm, y_norm, t_norm)).astype(np.float32)
+
+                        clean_array = np.column_stack((t_norm, x_norm, y_norm)).astype(np.float32)
 
                         if self.target_queue.full():
                             self.target_queue.get_nowait()
