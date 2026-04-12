@@ -121,7 +121,7 @@ class MainWindow(QWidget):
 
         q_img = QImage(cv_img.data, width, height, bytes_per_line, img_format)
         if matched_pred is not None:
-            px, py = self._map_pred_to_pixel(matched_pred, matched_mode, width, height)
+            px, py = self._map_pred_to_pixel_crop(matched_pred, width, height)
             if px is not None and py is not None:
                 painter = QPainter(q_img)
                 pen = QPen(QColor(255, 0, 0))
@@ -246,16 +246,22 @@ class MainWindow(QWidget):
         self.last_pred = None
         self.last_pred_mode = None
 
-    def _map_pred_to_pixel(self, pred, pred_mode, width, height):
+    def _map_pred_to_pixel_crop(self, pred, width, height):
         if pred is None:
             return None, None
         x, y = pred
-        if pred_mode == "norm":
-            px = int(x * width)
-            py = int(y * height)
-        else:
-            px = int(x)
-            py = int(y)
+        px = int(x * 512 + 96)
+        py = int(y * 512 - 16)
+        if px < 0 or py < 0 or px >= width or py >= height:
+            return None, None
+        return px, py
+
+    def _map_pred_to_pixel_norm(self, pred, width, height):
+        if pred is None:
+            return None, None
+        x, y = pred
+        px = int(x * width)
+        py = int(y * height)
         if px < 0 or py < 0 or px >= width or py >= height:
             return None, None
         return px, py

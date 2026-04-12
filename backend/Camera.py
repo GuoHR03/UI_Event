@@ -37,7 +37,7 @@ def downSampling_cropping_and_normalization(data_numpy, src_width=640, src_heigh
     t_max = t_values.max()
     t_min = t_values.min()
     t_values = (t_values - t_min) / (t_max - t_min + 1e-5)
-    # t_values = t_values * 0.1
+    t_values = t_values * 0.1
     return x_values, y_values, t_values
 
 
@@ -56,7 +56,7 @@ def downSampling_and_normalization(data_numpy, src_width=640, src_height=480, ds
     t_max = t_values.max()
     t_min = t_values.min()
     t_values = (t_values - t_min) / (t_max - t_min + 1e-5)
-    #t_values = t_values * 0.1
+    t_values = t_values * 0.1
     return x_values, y_values, t_values
 
 
@@ -111,7 +111,7 @@ class NNWorker(QThread):
                         nn_events = np.concatenate(buffer)
                         nn_events = np.column_stack((nn_events['x'], nn_events['y'], nn_events['t']))
 
-                        x_norm, y_norm, t_norm = downSampling_and_normalization(
+                        x_norm, y_norm, t_norm = downSampling_cropping_and_normalization(
                              nn_events, src_width=self.width, src_height=self.height
                         )
 
@@ -121,12 +121,12 @@ class NNWorker(QThread):
                             next_nn_time += self.nn_interval_us
                             continue
                         if len(x_norm) > target_points:
-                            indices = np.linspace(0, len(x_norm) - 1, target_points, dtype=int)
+                            indices = np.random.choice(len(x_norm), target_points, replace=False)
                             x_norm = x_norm[indices]
                             y_norm = y_norm[indices]
                             t_norm = t_norm[indices]
 
-                        clean_array = np.column_stack((x_norm, y_norm, t_norm)).astype(np.float32)
+                        clean_array = np.column_stack((t_norm, x_norm, y_norm)).astype(np.float32)
 
                         if self.target_queue.full():
                             self.target_queue.get_nowait()
@@ -279,6 +279,7 @@ class CameraThread(QThread):
         self.finished_signal.emit()
 
     def _run_h5_loop(self):
+        """ 需要大量修改"""
         total_events = len(self.events_dataset)
         current_idx = 0
 
@@ -340,12 +341,12 @@ class CameraThread(QThread):
 
                         target_points = 1024
                         if len(x_norm) >= target_points:
-                            indices = np.linspace(0, len(x_norm) - 1, target_points, dtype=int)
+                            indices = np.random.choice(len(x_norm), target_points, replace=False)
                             x_norm = x_norm[indices]
                             y_norm = y_norm[indices]
                             t_norm = t_norm[indices]
 
-                            clean_array = np.column_stack((x_norm, y_norm, t_norm)).astype(np.float32)
+                            clean_array = np.column_stack((t_norm, x_norm, y_norm)).astype(np.float32)
                             if self.target_queue.full():
                                 self.target_queue.get_nowait()
                             self.target_queue.put_nowait({
